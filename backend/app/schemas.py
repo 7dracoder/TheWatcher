@@ -16,8 +16,15 @@ class BoundingBox(BaseModel):
 
 class VisionResult(BaseModel):
     object_label: str
+    object_class: Literal["person", "vehicle", "other"] = "other"
+    detected: bool = True
+    confidence: float = 0.0
     bounding_box: Optional[BoundingBox] = None
     context: str = ""
+    # Rich visual signature for re-ID across cameras (clothing, stickers, colors…).
+    appearance: Optional[str] = None
+    # Plate text or the single most unique marker.
+    identity_hint: Optional[str] = None
 
 
 class Intersection(BaseModel):
@@ -78,19 +85,48 @@ class WatchRequest(BaseModel):
     camera_id: str
     object_description: str
     bounding_box: Optional[BoundingBox] = None
-    # Optional inline image (data URI) — overrides the camera's sample snapshot.
     image_data_uri: Optional[str] = None
     mode: Literal["nyc", "factory", "hospital"] = "nyc"
+    # Fast path: skip multi-camera scan + dual-model comparison (tracking loop).
+    fast: bool = False
+    skip_camera_scan: bool = False
+
+
+class HandoffInfo(BaseModel):
+    camera_id: str
+    camera_name: str
+    reason: str
+
+
+class CameraSighting(BaseModel):
+    """Object seen (or not) on a specific camera feed."""
+    camera_id: str
+    camera_name: str
+    lat: float
+    lng: float
+    detected: bool
+    confidence: float = 0.0
+    object_label: str = ""
+    bounding_box: Optional[BoundingBox] = None
 
 
 class WatchResponse(BaseModel):
     camera_id: str
+    active_camera_id: str
     mode: str
+    # Live tracking state: locked onto object / searching feeds / lost.
+    status: Literal["tracking", "searching", "lost", "idle"] = "idle"
+    # How many other feeds were scanned for the object this tick.
+    searching_count: int = 0
     # The "primary" merged result (Gemma preferred, Gemini fallback).
     vision: Optional[VisionResult] = None
     tracker: Optional[TrackerResult] = None
     prediction: Optional[PredictionResult] = None
     risk: Optional[RiskResult] = None
+    # Suggested next camera when the object moves out of frame / along a path.
+    handoff: Optional[HandoffInfo] = None
+    # Same object matched on nearby camera feeds (appearance / color / plate).
+    sightings: list[CameraSighting] = Field(default_factory=list)
     # Per-agent dual-run comparison for the UI.
     comparisons: list[AgentComparison] = Field(default_factory=list)
     # Human-readable control-room log lines.

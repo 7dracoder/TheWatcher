@@ -1,128 +1,516 @@
-import { useEffect, useState } from "react";
-import { getCameras, getHealth, watch } from "./api";
-import type { Camera, Health, WatchResponse } from "./types";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { getCameras, getHealth, watch, track } from "./api";
+import type { BoundingBox, Camera, Health, WatchResponse } from "./types";
 import MapView from "./components/MapView";
 import SnapshotPanel from "./components/SnapshotPanel";
+import NearbyFeeds from "./components/NearbyFeeds";
+import CameraSearch from "./components/CameraSearch";
 import AgentChat from "./components/AgentChat";
 import ComparisonView from "./components/ComparisonView";
+import { judgePickCameras, pickDefaultCamera } from "./utils/cameras";
 
 type Mode = "nyc" | "factory" | "hospital";
-type Tab = "control" | "compare";
+type Tab = "log" | "models";
+type TrackStatus = "idle" | "locking" | "tracking" | "searching" | "lost";
+
+function visionTrackLabel(v: WatchResponse["vision"]): string {
+  if (!v) return "";
+  if (v.appearance) return v.appearance;
+  if (v.identity_hint) return `${v.object_label} · ${v.identity_hint}`;
+  return v.object_label ?? "";
+}
+
+function visionShortLabel(v: WatchResponse["vision"]): string {
+  if (!v) return "—";
+  return v.object_label || "—";
+}
 
 export default function App() {
   const [health, setHealth] = useState<Health | null>(null);
   const [cameras, setCameras] = useState<Camera[]>([]);
   const [selected, setSelected] = useState<Camera | null>(null);
-  const [description, setDescription] = useState("yellow taxi in the crosswalk");
-  const [mode, setMode] = useState<Mode>("nyc");
-  const [tab, setTab] = useState<Tab>("control");
+  const [description, setDescription] = useState("");
+  const [mode] = useState<Mode>("nyc");
+  const [tab, setTab] = useState<Tab>("log");
   const [result, setResult] = useState<WatchResponse | null>(null);
   const [loading, setLoading] = useState(false);
+  const [tracking, setTracking] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [followEnabled, setFollowEnabled] = useState(true);
+  const [handoffNotice, setHandoffNotice] = useState<string | null>(null);
+  const [pickSeed, setPickSeed] = useState<BoundingBox | null>(null);
+  const [followingPick, setFollowingPick] = useState(false);
+  const [trackStatus, setTrackStatus] = useState<TrackStatus>("idle");
+  const [trailIds, setTrailIds] = useState<string[]>([]);
+  const [activityLog, setActivityLog] = useState<string[]>([]);
+  const trackingActive = useRef(false);
+  const pickSeedRef = useRef<BoundingBox | null>(null);
+  const trackLabelRef = useRef<string>("");
+  const trackInFlight = useRef(false);
+  // Bumped on every Stop / camera switch so in-flight requests can be discarded.
+  const runGen = useRef(0);
+
+  useEffect(() => {
+    pickSeedRef.current = pickSeed;
+  }, [pickSeed]);
 
   useEffect(() => {
     getHealth().then(setHealth).catch(() => {});
     getCameras()
       .then((cs) => {
         setCameras(cs);
-        if (cs.length) setSelected(cs[0]);
+        const def = pickDefaultCamera(cs);
+        if (def) setSelected(def);
       })
       .catch((e) => setError(String(e)));
   }, []);
 
-  async function runWatch() {
+  const judgeCams = judgePickCameras(cameras);
+  const gemmaOn = health?.providers.gemma.enabled;
+
+  const appendLog = useCallback((lines: string[]) => {
+    if (!lines.length) return;
+    const ts = new Date().toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+    // Collapse consecutive lines of the same kind (digits/timestamp ignored) so
+    // the live "Tracking …" line updates in place instead of flooding the log.
+    const kind = (s: string) =>
+      s
+        .replace(/^\[[^\]]*\]\s*/, "")
+        .replace(/\d+/g, "#")
+        .trim()
+        .toLowerCase();
+    setActivityLog((prev) => {
+      const out = [...prev];
+      for (const l of lines) {
+        const last = out[out.length - 1];
+        if (last && kind(last) === kind(l)) continue;
+        out.push(`[${ts}] ${l}`);
+      }
+      return out.slice(-120);
+    });
+  }, []);
+
+  const applyResult = useCallback(
+    (res: WatchResponse) => {
+      setResult(res);
+      appendLog(res.log ?? []);
+    },
+    [appendLog]
+  );
+
+  const extendTrail = useCallback((res: WatchResponse) => {
+    const add: string[] = [];
+    if (res.active_camera_id) add.push(res.active_camera_id);
+    for (const s of res.sightings ?? []) {
+      if (s.detected && s.confidence >= 0.48) add.push(s.camera_id);
+    }
+    if (!add.length) return;
+    setTrailIds((prev) => {
+      const next = [...prev];
+      for (const id of add) {
+        if (!next.includes(id)) next.push(id);
+      }
+      return next;
+    });
+  }, []);
+
+  const resetTrack = useCallback(() => {
+    runGen.current += 1;
+    trackInFlight.current = false;
+    setPickSeed(null);
+    pickSeedRef.current = null;
+    trackLabelRef.current = "";
+    setFollowingPick(false);
+    trackingActive.current = false;
+    setTracking(false);
+    setLoading(false);
+    setTrackStatus("idle");
+    setHandoffNotice(null);
+    setTrailIds([]);
+  }, []);
+
+  const selectCamera = useCallback(
+    (c: Camera) => {
+      resetTrack();
+      setActivityLog([]);
+      setSelected(c);
+    },
+    [resetTrack]
+  );
+
+  /** Switch feed without dropping an active track (nearby strip / handoff). */
+  const viewCamera = useCallback(
+    (c: Camera) => {
+      if (followingPick) {
+        setSelected(c);
+      } else {
+        selectCamera(c);
+      }
+    },
+    [followingPick, selectCamera]
+  );
+
+  const applyHandoff = useCallback(
+    (res: WatchResponse) => {
+      const label = visionTrackLabel(res.vision);
+      if (label) {
+        trackLabelRef.current = label;
+        setDescription(label);
+      }
+      if (followEnabled && res.handoff) {
+        const next = cameras.find((cam) => cam.id === res.handoff!.camera_id);
+        if (next && next.id !== selected?.id) {
+          setHandoffNotice(res.handoff.reason);
+          // Carry the matched box onto the new camera so we keep tracking it.
+          const box = res.vision?.bounding_box ?? null;
+          setPickSeed(box);
+          pickSeedRef.current = box;
+          setSelected(next);
+          setTrackStatus("tracking");
+        }
+      }
+    },
+    [cameras, selected, followEnabled]
+  );
+
+  const payloadBase = useCallback(
+    () => ({
+      camera_id: selected!.id,
+      object_description:
+        trackLabelRef.current || description || "vehicle or person",
+      mode,
+      bounding_box: pickSeedRef.current ?? undefined,
+    }),
+    [selected, description, mode]
+  );
+
+  const applyVision = useCallback((res: WatchResponse) => {
+    if (res.vision?.bounding_box && res.vision.detected) {
+      setPickSeed(res.vision.bounding_box);
+      pickSeedRef.current = res.vision.bounding_box;
+    }
+    const st = res.status;
+    if (st === "tracking") setTrackStatus("tracking");
+    else if (st === "searching") setTrackStatus("searching");
+    else if (st === "lost") setTrackStatus("lost");
+    else if (res.vision?.detected) setTrackStatus("tracking");
+    const label = visionTrackLabel(res.vision);
+    if (label) trackLabelRef.current = label;
+  }, []);
+
+  const runTrack = useCallback(
+    async (imageUri?: string | null) => {
+      if (!selected || trackInFlight.current) return;
+      if (!followingPick && !trackingActive.current) return;
+      const gen = runGen.current;
+      trackInFlight.current = true;
+      setTracking(true);
+      try {
+        const res = await track({
+          ...payloadBase(),
+          image_data_uri: imageUri ?? undefined,
+        });
+        if (gen !== runGen.current) return;
+        applyResult(res);
+        trackingActive.current = true;
+        applyVision(res);
+        extendTrail(res);
+        setFollowingPick(true);
+        applyHandoff(res);
+      } catch {
+        if (gen === runGen.current) setTrackStatus("lost");
+      } finally {
+        if (gen === runGen.current) {
+          trackInFlight.current = false;
+          setTracking(false);
+        }
+      }
+    },
+    [selected, payloadBase, applyHandoff, applyVision, extendTrail, followingPick, applyResult]
+  );
+
+  const runWatch = useCallback(async () => {
     if (!selected) return;
+    const gen = runGen.current;
     setLoading(true);
     setError(null);
     try {
-      const res = await watch({
-        camera_id: selected.id,
-        object_description: description,
-        mode,
-      });
-      setResult(res);
+      const res = await watch({ ...payloadBase(), fast: false });
+      if (gen !== runGen.current) return;
+      applyResult(res);
+      trackingActive.current = true;
+      applyVision(res);
+      if (res.vision?.object_label) {
+        setDescription(visionTrackLabel(res.vision));
+      }
+      applyHandoff(res);
     } catch (e) {
-      setError(String(e));
+      if (gen === runGen.current) setError(String(e));
     } finally {
-      setLoading(false);
+      if (gen === runGen.current) setLoading(false);
     }
-  }
+  }, [selected, payloadBase, applyHandoff, applyVision, applyResult]);
+
+  const onPickObject = useCallback(
+    async (box: BoundingBox, imageUri: string | null) => {
+      if (!selected || trackInFlight.current) return;
+      setPickSeed(box);
+      pickSeedRef.current = box;
+      setFollowingPick(true);
+      setTrackStatus("locking");
+      setHandoffNotice(null);
+      trackingActive.current = true;
+      trackLabelRef.current = "";
+      trackInFlight.current = true;
+      const gen = runGen.current;
+      setLoading(true);
+      setError(null);
+      try {
+        const res = await track({
+          camera_id: selected.id,
+          object_description: "clicked object — describe every visible detail",
+          mode,
+          bounding_box: box,
+          image_data_uri: imageUri ?? undefined,
+        });
+        if (gen !== runGen.current) return;
+        applyResult(res);
+        applyVision(res);
+        extendTrail(res);
+        const label = visionTrackLabel(res.vision);
+        if (label) setDescription(label);
+        applyHandoff(res);
+      } catch (e) {
+        if (gen === runGen.current) {
+          setError(String(e));
+          setTrackStatus("lost");
+        }
+      } finally {
+        if (gen === runGen.current) {
+          trackInFlight.current = false;
+          setLoading(false);
+        }
+      }
+    },
+    [selected, mode, applyHandoff, applyVision, extendTrail, applyResult]
+  );
+
+  const onFrameTrack = useCallback(
+    (imageUri: string) => {
+      if (!followEnabled || !followingPick || loading) return;
+      void runTrack(imageUri);
+    },
+    [followEnabled, followingPick, loading, runTrack]
+  );
+
+  const detectionForCamera =
+    result && selected && (followingPick || result.active_camera_id === selected.id)
+      ? result
+      : null;
+
+  const sightingCount = (detectionForCamera?.sightings ?? []).filter(
+    (s) => s.detected
+  ).length;
+
+  const gemmaMs = result?.comparisons?.find(
+    (c) => c.agent === "vision"
+  )?.gemma?.latency_ms;
 
   return (
     <div className="app">
       <header className="topbar">
-        <div className="brand">
-          <span className="logo">◉</span> TheWatcher
-          <span className="tagline">multimodal safety copilot · NYC</span>
+        <div className="topbar-left">
+          <img src="/logo.png" alt="" className="brand-logo" width={28} height={28} />
+          <div className="brand-text">
+            <h1>TheWatcher</h1>
+            <span className="topbar-guide">
+              Pick camera → <em>click object</em> → Gemma tracks nearby
+            </span>
+          </div>
         </div>
-        <div className="providers">
-          <ProviderPill
-            label="Gemma"
-            on={health?.providers.gemma.enabled}
-            model={health?.providers.gemma.model}
+        <div className="topbar-center">
+          {judgeCams.map((c) => (
+            <button
+              key={c.id}
+              type="button"
+              className={`cam-chip${selected?.id === c.id ? " active" : ""}`}
+              onClick={() => selectCamera(c)}
+            >
+              {c.name.split("@")[0].trim()}
+            </button>
+          ))}
+          <CameraSearch
+            cameras={cameras}
+            selected={selected}
+            onSelect={selectCamera}
+            compact
           />
-          <span className="pill">
-            511NY: {health?.data.ny511_live ? "live" : "sample"}
+        </div>
+        <div className="topbar-right">
+          <StatusDot
+            label="Gemma 4"
+            on={gemmaOn}
+            detail={health?.providers.gemma.model}
+          />
+          {gemmaOn && gemmaMs != null && (
+            <span
+              className="speed-badge"
+              title="Last Gemma 4 inference on Cerebras"
+            >
+              {gemmaMs} ms
+            </span>
+          )}
+          <span className="cam-count">
+            {cameras.length > 5 ? `${cameras.length} cams` : "demo"}
           </span>
         </div>
       </header>
 
-      <div className="modebar">
-        {(["nyc", "factory", "hospital"] as Mode[]).map((m) => (
-          <button
-            key={m}
-            className={mode === m ? "active" : ""}
-            onClick={() => setMode(m)}
-          >
-            {m === "nyc" ? "NYC Traffic" : m === "factory" ? "Factory (Sim)" : "Hospital (Sim)"}
-          </button>
-        ))}
-      </div>
+      {!gemmaOn && (
+        <div className="judge-warn">
+          Set <code>CEREBRAS_API_KEY</code> in backend/.env
+        </div>
+      )}
 
-      <main className="grid">
-        <section className="col map-col">
+      {handoffNotice && <div className="notice-bar">{handoffNotice}</div>}
+
+      <main className="workspace">
+        <section className="panel panel-map">
           <MapView
             cameras={cameras}
             selected={selected}
-            onSelect={setSelected}
+            onSelect={selectCamera}
             result={result}
+            trailIds={trailIds}
           />
         </section>
 
-        <section className="col mid-col">
-          <SnapshotPanel camera={selected} result={result} />
-          <div className="controls">
-            <label>What should TheWatcher watch?</label>
-            <textarea
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-              rows={2}
-            />
-            <button className="run-btn" onClick={runWatch} disabled={loading || !selected}>
-              {loading ? "Running agents…" : "▶ Run agents (Gemma)"}
-            </button>
-            {error && <div className="error-box">{error}</div>}
+        <section className="panel panel-feed">
+          <div className="feed-head">
+            <span className="feed-cam-name" title={selected?.name ?? ""}>
+              {selected?.name ?? "No camera"}
+            </span>
+            {detectionForCamera && (
+              <span
+                className="feed-stats-inline"
+                title={visionTrackLabel(detectionForCamera.vision) || undefined}
+              >
+                <b>{visionShortLabel(detectionForCamera.vision)}</b>
+                {detectionForCamera.vision?.appearance && (
+                  <>
+                    <span className="sep">·</span>
+                    <span className="feed-appearance">
+                      {detectionForCamera.vision.appearance.length > 48
+                        ? `${detectionForCamera.vision.appearance.slice(0, 46)}…`
+                        : detectionForCamera.vision.appearance}
+                    </span>
+                  </>
+                )}
+                <span className="sep">·</span>
+                {detectionForCamera.vision?.confidence != null
+                  ? `${Math.round(detectionForCamera.vision.confidence * 100)}%`
+                  : "—"}
+                {sightingCount > 1 && (
+                  <>
+                    <span className="sep">·</span>
+                    <span className="ok-text">{sightingCount} feeds</span>
+                  </>
+                )}
+              </span>
+            )}
           </div>
+
+          <NearbyFeeds
+            cameras={cameras}
+            selected={selected}
+            sightings={result?.sightings}
+            scanning={followingPick && (loading || tracking)}
+            onSelect={viewCamera}
+          />
+
+          <div className="feed-main">
+            <div className="feed-main-head">
+              <span>Main feed — click object to track</span>
+              <span className="feed-cam-name" title={selected?.name ?? ""}>
+                {selected?.name ?? ""}
+              </span>
+            </div>
+            <SnapshotPanel
+              camera={selected}
+              result={detectionForCamera}
+              pickSeed={pickSeed}
+              followingPick={followingPick}
+              trackStatus={trackStatus}
+              onPick={onPickObject}
+              onFrameTrack={onFrameTrack}
+              trackBusy={loading || tracking}
+            />
+          </div>
+
+          <footer className="feed-bar">
+            <input
+              type="text"
+              className="feed-input"
+              value={description}
+              onChange={(e) => {
+                setDescription(e.target.value);
+                trackLabelRef.current = e.target.value;
+              }}
+              placeholder="Visual signature (auto from Gemma)"
+            />
+            <label className="check-inline">
+              <input
+                type="checkbox"
+                checked={followEnabled}
+                onChange={(e) => setFollowEnabled(e.target.checked)}
+              />
+              Auto
+            </label>
+            {followingPick ? (
+              <button type="button" className="btn-sm" onClick={resetTrack}>
+                Stop
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="btn-sm btn-accent"
+                onClick={() => runWatch()}
+                disabled={loading || !selected}
+              >
+                Scan
+              </button>
+            )}
+            {error && <span className="feed-err">{error}</span>}
+          </footer>
         </section>
 
-        <section className="col right-col">
-          <div className="tabs">
-            <button
-              className={tab === "control" ? "active" : ""}
-              onClick={() => setTab("control")}
-            >
-              Control Room
-            </button>
-            <button
-              className={tab === "compare" ? "active" : ""}
-              onClick={() => setTab("compare")}
-            >
-              Gemma Analysis
-            </button>
-          </div>
-          <div className="tab-body">
-            {tab === "control" ? (
-              <AgentChat log={result?.log ?? []} />
+        <section className="panel panel-output">
+          <header className="panel-head panel-head-tabs">
+            <h2>Log</h2>
+            <div className="tab-group">
+              <button
+                type="button"
+                className={tab === "log" ? "active" : ""}
+                onClick={() => setTab("log")}
+              >
+                Agent
+              </button>
+              <button
+                type="button"
+                className={tab === "models" ? "active" : ""}
+                onClick={() => setTab("models")}
+              >
+                Gemma
+              </button>
+            </div>
+          </header>
+          <div className="panel-content">
+            {tab === "log" ? (
+              <AgentChat log={activityLog} />
             ) : (
               <ComparisonView comparisons={result?.comparisons ?? []} />
             )}
@@ -133,18 +521,19 @@ export default function App() {
   );
 }
 
-function ProviderPill({
+function StatusDot({
   label,
   on,
-  model,
+  detail,
 }: {
   label: string;
   on?: boolean;
-  model?: string;
+  detail?: string;
 }) {
   return (
-    <span className={`pill ${on ? "pill-on" : "pill-off"}`} title={model}>
-      {label}: {on ? "on" : "off"}
+    <span className="status-item" title={detail}>
+      <span className={`status-dot${on ? " on" : ""}`} />
+      {label}
     </span>
   );
 }

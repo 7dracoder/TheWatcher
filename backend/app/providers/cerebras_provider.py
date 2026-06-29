@@ -54,7 +54,7 @@ class CerebrasGemmaProvider(LLMProvider):
                 {"role": "system", "content": system},
                 {"role": "user", "content": content},
             ],
-            "temperature": 0.4,
+            "temperature": 0.15 if image_data_uri else 0.4,
         }
         if reasoning_effort != "default":
             payload["reasoning_effort"] = reasoning_effort

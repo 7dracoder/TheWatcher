@@ -1,14 +1,27 @@
 import type { AgentComparison, ModelRun } from "../types";
 
-const AGENT_TITLES: Record<string, string> = {
-  vision: "👁️ Vision Inspector",
-  tracker: "📍 Tracker",
-  prediction: "🧭 Prediction Planner",
-  risk: "⚠️ Risk Assessor",
+const AGENT_INFO: Record<string, { title: string; blurb: string }> = {
+  vision: {
+    title: "Vision Inspector",
+    blurb: "Finds the object in the camera image and draws a bounding box.",
+  },
+  tracker: {
+    title: "Tracker",
+    blurb: "Maps the object to a real NYC intersection on the map.",
+  },
+  prediction: {
+    title: "Prediction Planner",
+    blurb: "Guesses which direction the object is likely to move next.",
+  },
+  risk: {
+    title: "Risk Assessor",
+    blurb: "Scores each path using live NYC crash history nearby.",
+  },
 };
 
 function Metric({ run }: { run: ModelRun | null }) {
   if (!run) return <span className="muted">—</span>;
+  if (run.mocked) return <span className="badge badge-mock">mock</span>;
   if (!run.ok) return <span className="badge badge-err">error</span>;
   return (
     <span className="metrics">
@@ -25,7 +38,28 @@ function Metric({ run }: { run: ModelRun | null }) {
   );
 }
 
-export default function AnalysisView({
+function pickWinner(a: ModelRun | null, b: ModelRun | null): "gemma" | "gemini" | null {
+  const score = (r: ModelRun | null) => {
+    if (!r || r.mocked || !r.ok) return -1;
+    if (!r.parsed) return 0;
+    return 1000 - r.latency_ms;
+  };
+  const sa = score(a);
+  const sb = score(b);
+  if (sa < 0 && sb < 0) return null;
+  if (sa === sb) return null;
+  return sa > sb ? "gemma" : "gemini";
+}
+
+function totals(runs: ModelRun[]) {
+  return {
+    ms: runs.reduce((s, r) => s + (r.latency_ms || 0), 0),
+    tok: runs.reduce((s, r) => s + (r.total_tokens || 0), 0),
+    ok: runs.filter((r) => r.ok && r.parsed && !r.mocked).length,
+  };
+}
+
+export default function ComparisonView({
   comparisons,
 }: {
   comparisons: AgentComparison[];
@@ -33,56 +67,96 @@ export default function AnalysisView({
   if (!comparisons.length)
     return (
       <div className="panel-empty">
-        Run a watch to see the Gemma analysis per agent.
+        <p className="empty-title">No analysis yet</p>
+        <p className="empty-hint">
+          Pick a camera, describe what to watch, then hit <strong>Analyze</strong>.
+          You'll see Gemma (Cerebras) vs Gemini side-by-side for each AI agent.
+        </p>
       </div>
     );
 
-  const runs = comparisons.map((c) => c.gemma).filter(Boolean) as ModelRun[];
-  const totalMs = runs.reduce((s, r) => s + (r.latency_ms || 0), 0);
-  const totalTok = runs.reduce((s, r) => s + (r.total_tokens || 0), 0);
-  const okCount = runs.filter((r) => r.ok && r.parsed).length;
+  const gemmaRuns = comparisons.map((c) => c.gemma).filter(Boolean) as ModelRun[];
+  const geminiRuns = comparisons.map((c) => c.gemini).filter(Boolean) as ModelRun[];
+  const gTot = totals(gemmaRuns);
+  const mTot = totals(geminiRuns);
+  const gemmaLead =
+    gTot.ok > mTot.ok || (gTot.ok === mTot.ok && gTot.ms <= mTot.ms);
 
   return (
     <div className="comparison">
+      <p className="cmp-intro">
+        Same prompt, same image — two models, four agents. Green border = faster
+        valid JSON for that step.
+      </p>
+
       <div className="scoreboard">
-        <div className="score lead">
-          <div className="score-name">Total latency</div>
-          <div className="score-num">{totalMs}<span className="unit">ms</span></div>
-        </div>
-        <div className="score">
-          <div className="score-name">Total tokens</div>
-          <div className="score-num">{totalTok}</div>
-        </div>
-        <div className="score">
-          <div className="score-name">Valid JSON</div>
+        <div className={`score ${gemmaLead ? "lead" : ""}`}>
+          <div className="score-name">Gemma (Cerebras)</div>
           <div className="score-num">
-            {okCount}<span className="unit">/{comparisons.length}</span>
+            {gTot.ms}
+            <span className="unit">ms</span>
+          </div>
+          <div className="score-sub">
+            {gTot.tok} tok · {gTot.ok}/{comparisons.length} valid
+          </div>
+        </div>
+        <div className="score-vs">vs</div>
+        <div className={`score ${!gemmaLead ? "lead" : ""}`}>
+          <div className="score-name">Gemini (Google)</div>
+          <div className="score-num">
+            {mTot.ms}
+            <span className="unit">ms</span>
+          </div>
+          <div className="score-sub">
+            {mTot.tok} tok · {mTot.ok}/{comparisons.length} valid
           </div>
         </div>
       </div>
-      <p className="scoreboard-note">
-        Gemma <code>gemma-4-31b</code> on Cerebras — per-agent reasoning analysis.
-      </p>
 
       {comparisons.map((c) => {
-        const run = c.gemma;
+        const info = AGENT_INFO[c.agent] ?? { title: c.agent, blurb: "" };
+        const winner = pickWinner(c.gemma, c.gemini);
         return (
           <div className="cmp-row" key={c.agent}>
             <div className="cmp-agent-head">
-              <span className="cmp-agent">
-                {AGENT_TITLES[c.agent] ?? c.agent}
-              </span>
-              <Metric run={run} />
+              <div>
+                <span className="cmp-agent">{info.title}</span>
+                <p className="cmp-blurb">{info.blurb}</p>
+              </div>
             </div>
-            <div className="cmp-cell cmp-winner">
-              {run?.error && <div className="cmp-error">{run.error}</div>}
-              <pre className="cmp-json">
-                {run?.parsed
-                  ? JSON.stringify(run.parsed, null, 2)
-                  : run?.raw_text
-                    ? run.raw_text.slice(0, 500)
-                    : "(no output)"}
-              </pre>
+            <div className="cmp-grid">
+              <div className="cmp-head">Gemma · Cerebras</div>
+              <div className="cmp-head">Gemini · Google</div>
+              <div
+                className={`cmp-cell ${winner === "gemma" ? "cmp-winner" : ""}`}
+              >
+                <Metric run={c.gemma} />
+                {c.gemma?.error && (
+                  <div className="cmp-error">{c.gemma.error}</div>
+                )}
+                <pre className="cmp-json">
+                  {c.gemma?.parsed
+                    ? JSON.stringify(c.gemma.parsed, null, 2)
+                    : c.gemma?.raw_text
+                      ? c.gemma.raw_text.slice(0, 500)
+                      : "(no output)"}
+                </pre>
+              </div>
+              <div
+                className={`cmp-cell ${winner === "gemini" ? "cmp-winner" : ""}`}
+              >
+                <Metric run={c.gemini} />
+                {c.gemini?.error && (
+                  <div className="cmp-error">{c.gemini.error}</div>
+                )}
+                <pre className="cmp-json">
+                  {c.gemini?.parsed
+                    ? JSON.stringify(c.gemini.parsed, null, 2)
+                    : c.gemini?.raw_text
+                      ? c.gemini.raw_text.slice(0, 500)
+                      : "(no output)"}
+                </pre>
+              </div>
             </div>
           </div>
         );

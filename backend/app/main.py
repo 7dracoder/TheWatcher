@@ -9,6 +9,7 @@ from .agents.orchestrator import Orchestrator
 from .config import get_settings
 from .schemas import Camera, WatchRequest, WatchResponse
 from .services.nyc_data import NYCDataService
+from .services.routing import route_on_roads
 
 settings = get_settings()
 app = FastAPI(title="TheWatcher API", version="0.1.0")
@@ -36,6 +37,7 @@ async def health() -> dict:
         "data": {
             "ny511_live": bool(settings.ny511_api_key),
         },
+        "snapshot_interval_ms": 2000,
     }
 
 
@@ -81,7 +83,28 @@ async def watch(req: WatchRequest) -> WatchResponse:
     if not req.image_data_uri:
         req.image_data_uri = await nyc.snapshot_data_uri(cam)
     incidents = await nyc.incidents_near(cam.lat, cam.lng)
-    return await orchestrator.run(req, cam, incidents)
+    all_cams = await nyc.cameras()
+    return await orchestrator.run(req, cam, incidents, all_cams, nyc)
+
+
+@app.post("/api/track", response_model=WatchResponse)
+async def track(req: WatchRequest) -> WatchResponse:
+    """Fast tracking tick — dual-model vision, Gemma-only agents, no camera scan."""
+    req.fast = True
+    req.skip_camera_scan = True
+    return await watch(req)
+
+
+@app.get("/api/route")
+async def road_route(
+    from_lat: float,
+    from_lng: float,
+    to_lat: float,
+    to_lng: float,
+) -> dict:
+    """Road-following polyline between two points (OSRM / OpenStreetMap)."""
+    coords = await route_on_roads(from_lat, from_lng, to_lat, to_lng)
+    return {"coordinates": coords}
 
 
 # ---- Serve the built frontend (single-service deploy) -----------------
