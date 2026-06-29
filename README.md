@@ -321,7 +321,6 @@ Built for **[Gemma 4 on Cerebras](https://inference-docs.cerebras.ai/)** — mul
 | **People's Choice** | One-click demo on real NYC feeds; speed badge shows Cerebras latency live |
 | **Enterprise Impact** | Same stack for factory safety and hospital ops — see [Use cases](#use-cases) |
 
-**Demo video tips (≤60s):** show click-to-track → log lines → map trail → handoff to next camera → flash the **ms** badge next to Gemma 4. Optional: split-screen with Gemini latency in the comparison tab.
 
 ---
 
