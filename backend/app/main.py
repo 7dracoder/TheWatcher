@@ -84,6 +84,24 @@ async def watch(req: WatchRequest) -> WatchResponse:
     return await orchestrator.run(req, cam, incidents)
 
 
+# ---- Serve the built frontend (single-service deploy) -----------------
+# Mounted LAST so it never shadows the /api routes above. In production the
+# Docker build copies frontend/dist here; locally this dir may not exist
+# (use the Vite dev server instead).
+import os
+from pathlib import Path
+
+from fastapi.staticfiles import StaticFiles
+
+_static_dir = Path(
+    os.environ.get(
+        "WATCHER_STATIC_DIR", str(Path(__file__).resolve().parent.parent / "static")
+    )
+)
+if _static_dir.is_dir():
+    app.mount("/", StaticFiles(directory=str(_static_dir), html=True), name="static")
+
+
 def run() -> None:
     import uvicorn
 
