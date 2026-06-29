@@ -1,11 +1,17 @@
 """NYC camera + alert data.
 
-Uses the live 511NY API when NY511_API_KEY is present; otherwise falls back
-to the bundled sample camera list so the app is fully demoable offline.
+Camera source priority:
+  1. NYC DOT public API (webcams.nyctmc.org) — no key, ~950 live cameras.
+  2. 511NY API (if NY511_API_KEY set).
+  3. Bundled sample cameras (fully offline fallback).
+We fetch the camera list server-side to avoid the browser CORS block, and the
+live JPEG snapshots are base64'd here so the vision model can consume them.
 """
 from __future__ import annotations
 
+import base64
 import json
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -15,6 +21,7 @@ from ..config import get_settings
 from ..schemas import Camera
 
 _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+_NYCTMC_BASE = "https://webcams.nyctmc.org/api/cameras"
 
 
 def _load_sample_cameras() -> list[Camera]:
@@ -67,20 +74,72 @@ class NYCDataService:
     async def cameras(self) -> list[Camera]:
         if self._cameras:
             return self._cameras
+        # 1. NYC DOT public API (no key)
+        try:
+            cams = await self._fetch_nyctmc_cameras()
+            if cams:
+                self._cameras = cams
+                return self._cameras
+        except Exception:  # noqa: BLE001 — fall through
+            pass
+        # 2. 511NY (if key)
         if self.settings.ny511_api_key:
             try:
                 self._cameras = await self._fetch_live_cameras()
                 return self._cameras
-            except Exception:  # noqa: BLE001 — fall back to samples
+            except Exception:  # noqa: BLE001
                 pass
-        self._cameras = _load_sample_cameras()
-        return self._cameras
+        # 3. bundled samples — NOT cached, so we retry the live source next call
+        return _load_sample_cameras()
 
     async def camera(self, camera_id: str) -> Optional[Camera]:
         for c in await self.cameras():
             if c.id == camera_id:
                 return c
         return None
+
+    async def _fetch_nyctmc_cameras(self) -> list[Camera]:
+        async with httpx.AsyncClient(timeout=45, follow_redirects=True) as client:
+            resp = await client.get(_NYCTMC_BASE)
+        resp.raise_for_status()
+        out: list[Camera] = []
+        for it in resp.json():
+            try:
+                if str(it.get("isOnline", "")).lower() != "true":
+                    continue
+                name = it.get("name", "NYC DOT Camera")
+                cam_id = str(it["id"])
+                out.append(
+                    Camera(
+                        id=cam_id,
+                        name=name,
+                        lat=float(it["latitude"]),
+                        lng=float(it["longitude"]),
+                        # split "A Ave @ B St" into individual roads for the tracker
+                        roads=[s.strip() for s in re.split(r"[@&/]", name) if s.strip()],
+                        image_url=it.get("imageUrl") or f"{_NYCTMC_BASE}/{cam_id}/image",
+                        sample_image=None,
+                    )
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+        return out
+
+    async def snapshot_data_uri(self, camera: Camera) -> Optional[str]:
+        """Fetch a live JPEG and return it as a base64 data URI for the vision
+        model. Falls back to any bundled sample image, then a drawn placeholder.
+        """
+        if camera.image_url:
+            try:
+                async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+                    r = await client.get(camera.image_url)
+                r.raise_for_status()
+                ct = r.headers.get("content-type", "image/jpeg").split(";")[0]
+                b64 = base64.b64encode(r.content).decode("ascii")
+                return f"data:{ct};base64,{b64}"
+            except Exception:  # noqa: BLE001
+                pass
+        return camera.sample_image or _placeholder_snapshot(camera.name)
 
     async def _fetch_live_cameras(self) -> list[Camera]:
         url = "https://511ny.org/api/getcameras"

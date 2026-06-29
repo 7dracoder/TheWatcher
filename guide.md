@@ -3,10 +3,10 @@
 > Multimodal, multi-agent safety & tracking copilot for NYC.
 > Pick a camera → say what to watch → four Gemma-4 agents identify it, map it,
 > predict where it goes, and score the risk — overlaid live on an NYC map.
-> **Every agent runs on both Gemma (Cerebras) and Gemini, side by side.**
+> **Every agent runs on Gemma 4 (via Cerebras), with a per-agent analysis panel.**
 
 This single file is the source of truth: architecture, setup, how the
-Gemma-vs-Gemini comparison works, current live-test status, the demo script,
+Gemma analysis panel works, current live-test status, the demo script,
 and what's still needed.
 
 ---
@@ -17,26 +17,28 @@ and what's still needed.
 |---|---|
 | Backend (FastAPI) | ✅ builds + boots, verified live |
 | Gemma agents (Vision/Tracker/Prediction/Risk) | ✅ all 4 run **live** on `gemma-4-31b` |
-| Gemini agents | ✅ all 4 run **live** on `gemini-2.5-flash` |
-| Side-by-side comparison | ✅ **fully live** — both models, real metrics |
+| Gemma Analysis panel | ✅ per-agent latency / tokens / JSON + reasoning |
+| Gemini | ⏸️ disabled by choice — provider kept dormant, easy to re-enable |
 | Risk agent crash data | ✅ **live** NYC Open Data (Socrata) crash history |
 | Frontend (React/Vite) | ✅ `npm run build` passes |
 | Map tiles | ✅ **Geoapify** (osm-bright), OSM fallback |
-| NYC cameras | ⏳ 5 bundled samples; live 511NY when that key arrives (emailed) |
+| NYC cameras | ✅ **955 live NYC DOT cameras** (no key) + live JPEG snapshots |
 
-**Verified full dual-model run** (both keys live):
+**Verified Gemma-only run** (live):
 
 ```
-                 GEMMA (gemma-4-31b)        GEMINI (gemini-2.5-flash)
-[vision    ]  ok  871ms  520 tok  json✓   |  ok  8250ms  1924 tok  json✓
-[tracker   ]  ok  664ms  304 tok  json✓   |  ok  5167ms  1203 tok  json✓
-[prediction]  ok  605ms  224 tok  json✓   |  ok  3638ms   855 tok  json✓
-[risk      ]  ok  790ms  311 tok  json✓   |  ok  5680ms  1302 tok  json✓
+              GEMMA (gemma-4-31b)
+[vision    ]  ok  823ms  579 tok  json✓
+[tracker   ]  ok  462ms  359 tok  json✓
+[prediction]  ok  377ms  226 tok  json✓
+[risk      ]  ok  421ms  305 tok  json✓
 ```
 
-**Headline finding:** on identical prompts, **Gemma on Cerebras is ~6–10× faster
-and uses ~4× fewer tokens** than Gemini 2.5-flash (which spends tokens on
-"thinking"), while both produce valid JSON. That's the demo's money shot.
+**Gemma Analysis panel:** the right-hand tab shows, per agent, Gemma's latency,
+token usage, JSON-validity, and full reasoning output — plus totals across the
+pipeline. (We earlier ran Gemini side-by-side; per your call it's disabled and
+the panel is now a clean Gemma analysis. The Gemini provider is still in the
+codebase, dormant — re-enable in `orchestrator._run_agent`.)
 
 **Live Risk data:** the Risk agent now reasons over real NYC crash history —
 e.g. the 7th Ave @ W 34th St corner returns *"6,263 historical crashes within
@@ -82,7 +84,7 @@ TheWatcher/
             ├── MapView.tsx          Leaflet map, camera markers, risk-colored arcs
             ├── SnapshotPanel.tsx    snapshot + vision bounding box
             ├── AgentChat.tsx        control-room log
-            └── ComparisonView.tsx   ★ Gemma vs Gemini scoreboard
+            └── ComparisonView.tsx   ★ Gemma analysis panel (per-agent metrics)
 ```
 
 ### Request flow
@@ -91,9 +93,9 @@ TheWatcher/
 Browser → /api/watch {camera_id, object_description, mode}
         → Orchestrator
              ├─ Vision     ┐
-             ├─ Tracker    │ each step: Gemma + Gemini run CONCURRENTLY
-             ├─ Prediction │ (asyncio.gather) → metrics captured
-             └─ Risk       ┘ → "primary" result (Gemma preferred) feeds next
+             ├─ Tracker    │ each step runs on Gemma →
+             ├─ Prediction │ metrics captured (latency / tokens / JSON)
+             └─ Risk       ┘ → parsed result feeds the next agent
         → WatchResponse { vision, tracker, prediction, risk, comparisons[], log[] }
 ```
 
@@ -142,40 +144,39 @@ Open **http://localhost:5173**.
 
 ---
 
-## 4. The Gemma vs Gemini comparison ★
+## 4. The Gemma Analysis panel ★
 
-This is the headline feature you asked for. The **"Gemma vs Gemini"** tab
-(right panel) shows, for each agent, a side-by-side cell:
+The **"Gemma Analysis"** tab (right panel) shows, for each agent, Gemma's run:
 
-| Column | Gemma (Cerebras) | Gemini (Google) |
-|---|---|---|
-| Latency | per-call ms | per-call ms |
-| Tokens | prompt / completion / total | prompt / completion / total |
-| Output | parsed JSON (or raw fallback) | parsed JSON (or raw fallback) |
-| Valid JSON? | ✓ / ✗ badge | ✓ / ✗ badge |
-| Status | ok / error / mock | ok / error / mock |
+| Field | Shown |
+|---|---|
+| Latency | per-call ms |
+| Tokens | total tokens used |
+| Output | parsed JSON (or raw fallback) |
+| Valid JSON? | ✓ / ✗ badge |
+| Reasoning | the agent's structured output / explanation |
 
-A **scoreboard** at the top tallies a per-agent winner.
+A header strip tallies pipeline **totals**: total latency, total tokens, and
+how many of the 4 agents returned valid JSON.
 
-**How "winner" is decided** (`scoreRun` in
-`frontend/src/components/ComparisonView.tsx`): the model that returned **valid
-JSON the fastest** wins that agent. It's automatic and demo-friendly. To judge
-by *output quality* instead, change that one function (e.g. add a rubric, or
-have a judge model score both outputs).
+**Why it's a clean story:** every agent gets a strict-JSON prompt (from
+`agents/prompts.py`) and the same live image, and is parsed by the same
+extractor — so the panel is an honest readout of how Gemma performs each step.
 
-**Why this design is fair:** both providers get the *identical* system+user
-prompt (from `agents/prompts.py`) and the same image, run concurrently, and are
-parsed by the same extractor. The only variable is the model.
+> We originally ran Gemini side-by-side here. Per the current design decision,
+> Gemini is **disabled** and the panel is a Gemma-only analysis. The Gemini
+> provider and adapter remain in the codebase (dormant); re-enable by adding a
+> `self.gemini.run(...)` call in `orchestrator._run_agent` and rendering the
+> `gemini` field again in `ComparisonView.tsx`.
 
-**Current state:** ✅ both columns are live (`gemma-4-31b` vs `gemini-2.5-flash`).
+### Talking points
 
-### What a comparison typically reveals (talking points)
-
-- **Speed:** Cerebras is built for very high tokens/sec — expect Gemma latencies
-  to be low and consistent (we saw ~460–630 ms/agent). Great live-demo story.
-- **Structure adherence:** both are prompted for strict JSON; the badge shows
-  who actually complied.
-- **Cost/efficiency:** token counts are shown per call for a like-for-like read.
+- **Speed:** Cerebras runs Gemma at very high tokens/sec — agents land in
+  ~380–820 ms each, so the whole 4-agent pipeline finishes in ~2 s. Great live
+  demo feel.
+- **Structure adherence:** every agent is prompted for strict JSON; the badge
+  shows compliance (4/4 valid in testing).
+- **Cost/efficiency:** per-agent token counts are shown for a transparent read.
 
 ---
 
@@ -195,7 +196,7 @@ parsed by the same extractor. The only variable is the model.
 2. Snapshot appears; type **"yellow taxi heading north"**; hit **Run agents**.
 3. **Control Room** tab streams the 4 agent log lines.
 4. Map shows the object marker + probability arcs, colored green→red by risk.
-5. Flip to **Gemma vs Gemini** tab → scoreboard + per-agent latency/tokens/JSON.
+5. Flip to **Gemma Analysis** tab → per-agent latency/tokens/JSON + reasoning, with pipeline totals.
 6. (If factory/hospital images added) flip tabs → HALT / ALERT overlay.
 7. Tagline: *"TheWatcher — multimodal safety copilot for cities, factories, and
    care, powered by Cerebras + Gemma 4."*
@@ -207,11 +208,11 @@ parsed by the same extractor. The only variable is the model.
 | # | Item | Effect | Status |
 |---|---|---|---|
 | 1 | `CEREBRAS_API_KEY` | live Gemma agents | ✅ done & verified |
-| 2 | `GEMINI_API_KEY` | makes the comparison live | ✅ done & verified |
+| 2 | `GEMINI_API_KEY` | only needed if re-enabling the comparison | ⏸️ not used now |
 | 3 | `SOCRATA_APP_TOKEN` | real NYC crash data in Risk agent | ✅ done & verified |
 | 4 | `VITE_GEOAPIFY_KEY` | nicer map tiles | ✅ done |
-| 5 | `NY511_API_KEY` | real NYC cameras + live alerts | ⏳ pending (emailed) |
-| 6 | 1–2 real traffic-cam JPEGs | convincing vision demo (samples are drawn) | ⏳ optional |
+| 5 | NYC DOT cameras | 955 live cameras + snapshots, no key | ✅ done |
+| 6 | `NY511_API_KEY` | adds live *traffic alerts* (cameras already covered) | ⏳ optional |
 | 7 | Factory + Hospital screenshots | populate the Sim tabs | ⏳ optional |
 
 **Decisions to confirm:**
@@ -237,9 +238,9 @@ Add any key by editing `backend/.env`, then restart the backend.
 
 | Symptom | Cause / fix |
 |---|---|
-| Vision agent 400 error | image must be raster (PNG/JPEG), not SVG — samples are now PNG |
-| Gemini column says "mock" | add `GEMINI_API_KEY` to `backend/.env`, restart |
-| Only 5 cameras | no 511NY key → sample data; add `NY511_API_KEY` |
+| Vision agent 400 error | image must be raster (PNG/JPEG), not SVG — live snapshots are JPEG |
+| Only 5 cameras | NYC DOT fetch failed → using samples; retries next call (transient) |
+| Markers laggy | 955 cameras render at once — ask to add clustering |
 | Map tiles blank | offline; OSM tiles need internet |
 | Wrong Gemma model | set `CEREBRAS_MODEL` in `.env` (yours: `gemma-4-31b`) |
 | VS Code "package not installed" hint | select the `backend/.venv` interpreter |

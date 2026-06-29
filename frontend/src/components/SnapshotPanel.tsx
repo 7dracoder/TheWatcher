@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import type { Camera, WatchResponse } from "../types";
 
 export default function SnapshotPanel({
@@ -7,12 +8,18 @@ export default function SnapshotPanel({
   camera: Camera | null;
   result: WatchResponse | null;
 }) {
+  // Tick to cache-bust the live JPEG (NYC DOT updates every ~2s).
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    if (!camera || camera.sample_image) return;
+    const id = setInterval(() => setTick((t) => t + 1), 3000);
+    return () => clearInterval(id);
+  }, [camera]);
+
   if (!camera)
     return <div className="panel-empty">Select a camera on the map.</div>;
 
   const box = result?.vision?.bounding_box;
-  const img = camera.sample_image ?? camera.image_url ?? "";
-
   // Vision models return normalized 0-1000 coordinates (resolution-independent).
   const clampPct = (v: number) => Math.max(0, Math.min((v / 1000) * 100, 100));
   const pct = box && {
@@ -22,6 +29,13 @@ export default function SnapshotPanel({
     height: clampPct(box.height),
   };
 
+  // Sample cameras carry an inline data-URI; live NYC DOT cameras stream via the
+  // backend proxy (avoids CORS and lets us cache-bust for a live feel).
+  const isLive = !camera.sample_image;
+  const img = camera.sample_image
+    ? camera.sample_image
+    : `/api/cameras/${camera.id}/snapshot?t=${tick}`;
+
   return (
     <div className="snapshot">
       <div className="snapshot-frame">
@@ -30,6 +44,7 @@ export default function SnapshotPanel({
         ) : (
           <div className="panel-empty">no snapshot</div>
         )}
+        {isLive && <span className="live-badge">● LIVE</span>}
         {pct && (
           <div
             className="bbox"

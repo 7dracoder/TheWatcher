@@ -1,7 +1,8 @@
 """TheWatcher FastAPI backend."""
 from __future__ import annotations
 
-from fastapi import FastAPI, HTTPException
+import httpx
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from .agents.orchestrator import Orchestrator
@@ -51,6 +52,23 @@ async def get_camera(camera_id: str) -> Camera:
     return cam
 
 
+@app.get("/api/cameras/{camera_id}/snapshot")
+async def camera_snapshot(camera_id: str) -> Response:
+    """Proxy the live NYC DOT JPEG (avoids CORS / lets us cache-bust)."""
+    cam = await nyc.camera(camera_id)
+    if not cam or not cam.image_url:
+        raise HTTPException(status_code=404, detail="no snapshot for camera")
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+        r = await client.get(cam.image_url)
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail="upstream snapshot failed")
+    return Response(
+        content=r.content,
+        media_type=r.headers.get("content-type", "image/jpeg"),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @app.post("/api/watch", response_model=WatchResponse)
 async def watch(req: WatchRequest) -> WatchResponse:
     cam = await nyc.camera(req.camera_id)
@@ -59,6 +77,9 @@ async def watch(req: WatchRequest) -> WatchResponse:
         if req.mode == "nyc":
             raise HTTPException(status_code=404, detail="camera not found")
         cam = Camera(id=req.camera_id, name=f"{req.mode} feed", lat=0.0, lng=0.0)
+    # Pull a live snapshot for the vision agent if the client didn't supply one.
+    if not req.image_data_uri:
+        req.image_data_uri = await nyc.snapshot_data_uri(cam)
     incidents = await nyc.incidents_near(cam.lat, cam.lng)
     return await orchestrator.run(req, cam, incidents)
 

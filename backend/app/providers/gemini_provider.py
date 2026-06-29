@@ -5,6 +5,7 @@ side-by-side comparison UI still renders (clearly flagged mocked=true).
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Optional
 
@@ -62,9 +63,15 @@ class GeminiProvider(LLMProvider):
         start = time.perf_counter()
         try:
             async with httpx.AsyncClient(timeout=60) as client:
-                resp = await client.post(
-                    url, params={"key": self.api_key}, json=payload
-                )
+                # Retry transient rate-limit / overload responses with backoff.
+                for attempt in range(3):
+                    resp = await client.post(
+                        url, params={"key": self.api_key}, json=payload
+                    )
+                    if resp.status_code in (429, 503) and attempt < 2:
+                        await asyncio.sleep(1.5 * (attempt + 1))
+                        continue
+                    break
             latency = int((time.perf_counter() - start) * 1000)
             resp.raise_for_status()
             data = resp.json()

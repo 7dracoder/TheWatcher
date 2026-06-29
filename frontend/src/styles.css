@@ -54,6 +54,7 @@ body {
 .snapshot-frame img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .bbox { position: absolute; border: 2px solid var(--accent); box-shadow: 0 0 0 9999px rgba(0,0,0,0.25); border-radius: 3px; }
 .bbox span { position: absolute; top: -20px; left: 0; background: var(--accent); color: #fff; font-size: 11px; padding: 1px 6px; border-radius: 3px; white-space: nowrap; }
+.live-badge { position: absolute; top: 8px; right: 8px; background: rgba(255,77,79,0.85); color: #fff; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 4px; letter-spacing: 0.5px; }
 .snapshot-meta { display: flex; flex-direction: column; margin-top: 8px; }
 .snapshot-meta .muted { font-size: 12px; }
 
@@ -91,6 +92,9 @@ textarea {
 
 .cmp-row { margin-bottom: 14px; }
 .cmp-agent { font-weight: 700; margin-bottom: 6px; }
+.cmp-agent-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
+.cmp-agent-head .cmp-agent { margin-bottom: 0; }
+.score-num .unit { font-size: 13px; color: var(--muted); font-weight: 500; margin-left: 2px; }
 .cmp-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 .cmp-head { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
 .cmp-cell { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px; }

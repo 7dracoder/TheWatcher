@@ -7,18 +7,9 @@ const AGENT_TITLES: Record<string, string> = {
   risk: "⚠️ Risk Assessor",
 };
 
-function scoreRun(r: ModelRun | null): number {
-  // Simple win heuristic: parsed valid JSON + lower latency.
-  if (!r || !r.ok || !r.parsed) return -1;
-  return 1000 - Math.min(r.latency_ms, 1000) / 10;
-}
-
 function Metric({ run }: { run: ModelRun | null }) {
   if (!run) return <span className="muted">—</span>;
-  if (run.mocked)
-    return <span className="badge badge-mock">mock (no key)</span>;
-  if (!run.ok)
-    return <span className="badge badge-err">error</span>;
+  if (!run.ok) return <span className="badge badge-err">error</span>;
   return (
     <span className="metrics">
       <span className="badge badge-ok">{run.latency_ms} ms</span>
@@ -34,23 +25,7 @@ function Metric({ run }: { run: ModelRun | null }) {
   );
 }
 
-function Cell({ run, winner }: { run: ModelRun | null; winner: boolean }) {
-  return (
-    <div className={`cmp-cell ${winner ? "cmp-winner" : ""}`}>
-      <Metric run={run} />
-      {run?.error && <div className="cmp-error">{run.error}</div>}
-      <pre className="cmp-json">
-        {run?.parsed
-          ? JSON.stringify(run.parsed, null, 2)
-          : run?.raw_text
-            ? run.raw_text.slice(0, 400)
-            : "(no output)"}
-      </pre>
-    </div>
-  );
-}
-
-export default function ComparisonView({
+export default function AnalysisView({
   comparisons,
 }: {
   comparisons: AgentComparison[];
@@ -58,49 +33,56 @@ export default function ComparisonView({
   if (!comparisons.length)
     return (
       <div className="panel-empty">
-        Run a watch to see Gemma vs Gemini side by side.
+        Run a watch to see the Gemma analysis per agent.
       </div>
     );
 
-  // Aggregate scoreboard
-  let gemmaWins = 0;
-  let geminiWins = 0;
-  for (const c of comparisons) {
-    const g = scoreRun(c.gemma);
-    const e = scoreRun(c.gemini);
-    if (g > e) gemmaWins++;
-    else if (e > g) geminiWins++;
-  }
+  const runs = comparisons.map((c) => c.gemma).filter(Boolean) as ModelRun[];
+  const totalMs = runs.reduce((s, r) => s + (r.latency_ms || 0), 0);
+  const totalTok = runs.reduce((s, r) => s + (r.total_tokens || 0), 0);
+  const okCount = runs.filter((r) => r.ok && r.parsed).length;
 
   return (
     <div className="comparison">
       <div className="scoreboard">
-        <div className={`score ${gemmaWins >= geminiWins ? "lead" : ""}`}>
-          <div className="score-name">Gemma (Cerebras)</div>
-          <div className="score-num">{gemmaWins}</div>
+        <div className="score lead">
+          <div className="score-name">Total latency</div>
+          <div className="score-num">{totalMs}<span className="unit">ms</span></div>
         </div>
-        <div className="score-vs">vs</div>
-        <div className={`score ${geminiWins > gemmaWins ? "lead" : ""}`}>
-          <div className="score-name">Gemini</div>
-          <div className="score-num">{geminiWins}</div>
+        <div className="score">
+          <div className="score-name">Total tokens</div>
+          <div className="score-num">{totalTok}</div>
+        </div>
+        <div className="score">
+          <div className="score-name">Valid JSON</div>
+          <div className="score-num">
+            {okCount}<span className="unit">/{comparisons.length}</span>
+          </div>
         </div>
       </div>
       <p className="scoreboard-note">
-        Per-agent winner = produced valid JSON fastest. {gemmaWins + geminiWins}
-        /{comparisons.length} agents had a clear winner.
+        Gemma <code>gemma-4-31b</code> on Cerebras — per-agent reasoning analysis.
       </p>
 
       {comparisons.map((c) => {
-        const g = scoreRun(c.gemma);
-        const e = scoreRun(c.gemini);
+        const run = c.gemma;
         return (
           <div className="cmp-row" key={c.agent}>
-            <div className="cmp-agent">{AGENT_TITLES[c.agent] ?? c.agent}</div>
-            <div className="cmp-grid">
-              <div className="cmp-head">Gemma</div>
-              <div className="cmp-head">Gemini</div>
-              <Cell run={c.gemma} winner={g > e && g >= 0} />
-              <Cell run={c.gemini} winner={e > g && e >= 0} />
+            <div className="cmp-agent-head">
+              <span className="cmp-agent">
+                {AGENT_TITLES[c.agent] ?? c.agent}
+              </span>
+              <Metric run={run} />
+            </div>
+            <div className="cmp-cell cmp-winner">
+              {run?.error && <div className="cmp-error">{run.error}</div>}
+              <pre className="cmp-json">
+                {run?.parsed
+                  ? JSON.stringify(run.parsed, null, 2)
+                  : run?.raw_text
+                    ? run.raw_text.slice(0, 500)
+                    : "(no output)"}
+              </pre>
             </div>
           </div>
         );

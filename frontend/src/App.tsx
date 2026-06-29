@@ -61,11 +61,6 @@ export default function App() {
             on={health?.providers.gemma.enabled}
             model={health?.providers.gemma.model}
           />
-          <ProviderPill
-            label="Gemini"
-            on={health?.providers.gemini.enabled}
-            model={health?.providers.gemini.model}
-          />
           <span className="pill">
             511NY: {health?.data.ny511_live ? "live" : "sample"}
           </span>
@@ -104,7 +99,7 @@ export default function App() {
               rows={2}
             />
             <button className="run-btn" onClick={runWatch} disabled={loading || !selected}>
-              {loading ? "Running agents…" : "▶ Run agents (Gemma + Gemini)"}
+              {loading ? "Running agents…" : "▶ Run agents (Gemma)"}
             </button>
             {error && <div className="error-box">{error}</div>}
           </div>
@@ -122,7 +117,7 @@ export default function App() {
               className={tab === "compare" ? "active" : ""}
               onClick={() => setTab("compare")}
             >
-              Gemma vs Gemini
+              Gemma Analysis
             </button>
           </div>
           <div className="tab-body">

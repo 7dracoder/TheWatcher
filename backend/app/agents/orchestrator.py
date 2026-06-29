@@ -1,12 +1,12 @@
-"""Runs the 4-agent pipeline, executing each step on BOTH Gemma and Gemini.
+"""Runs the 4-agent pipeline on Gemma, capturing per-agent metrics.
 
-For every agent we fire both providers concurrently, capture metrics, then
-pick a "primary" parsed result (Gemma preferred, Gemini fallback) to feed the
-next agent. The per-agent comparisons are returned for the side-by-side UI.
+Each agent step runs on Gemma (via Cerebras); we capture latency / tokens /
+parsed JSON and feed the parsed result into the next agent. The per-agent
+runs are returned for the Gemma analysis panel. (The Gemini provider is kept
+in place but dormant — see _run_agent to re-enable a side-by-side comparison.)
 """
 from __future__ import annotations
 
-import asyncio
 from typing import Any, Optional
 
 from ..providers.base import LLMProvider
@@ -34,25 +34,27 @@ class Orchestrator:
         self.gemma: LLMProvider = CerebrasGemmaProvider()
         self.gemini: LLMProvider = GeminiProvider()
 
-    async def _dual_run(
+    async def _run_agent(
         self,
         agent: str,
         system: str,
         user: str,
         image_data_uri: Optional[str] = None,
     ) -> AgentComparison:
-        gemma_run, gemini_run = await asyncio.gather(
-            self.gemma.run(system=system, user=user, image_data_uri=image_data_uri),
-            self.gemini.run(system=system, user=user, image_data_uri=image_data_uri),
+        # Gemma-only analysis. (Gemini provider kept dormant — to re-enable a
+        # side-by-side comparison, also run self.gemini.run(...) here and set
+        # gemini=that result.)
+        gemma_run = await self.gemma.run(
+            system=system, user=user, image_data_uri=image_data_uri
         )
-        return AgentComparison(agent=agent, gemma=gemma_run, gemini=gemini_run)
+        return AgentComparison(agent=agent, gemma=gemma_run, gemini=None)
 
     @staticmethod
     def _primary(cmp: AgentComparison) -> Optional[dict[str, Any]]:
-        """Prefer Gemma's parsed output, fall back to Gemini's."""
-        for run in (cmp.gemma, cmp.gemini):
-            if run and run.ok and run.parsed:
-                return run.parsed
+        """Use Gemma's parsed output."""
+        run = cmp.gemma
+        if run and run.ok and run.parsed:
+            return run.parsed
         return None
 
     async def run(
@@ -63,7 +65,7 @@ class Orchestrator:
         image = req.image_data_uri or camera.sample_image
 
         # 1. Vision
-        vcmp = await self._dual_run(
+        vcmp = await self._run_agent(
             "vision",
             prompts.VISION_SYSTEM,
             prompts.vision_user(req.object_description, req.mode),
@@ -77,7 +79,7 @@ class Orchestrator:
         log.append(f"Vision Agent: {vision.object_label} — {vision.context}")
 
         # 2. Tracker
-        tcmp = await self._dual_run(
+        tcmp = await self._run_agent(
             "tracker",
             prompts.TRACKER_SYSTEM,
             prompts.tracker_user(camera, vision.context),
@@ -95,7 +97,7 @@ class Orchestrator:
         )
 
         # 3. Prediction
-        pcmp = await self._dual_run(
+        pcmp = await self._run_agent(
             "prediction",
             prompts.PREDICTION_SYSTEM,
             prompts.prediction_user(
@@ -118,7 +120,7 @@ class Orchestrator:
         )
 
         # 4. Risk
-        rcmp = await self._dual_run(
+        rcmp = await self._run_agent(
             "risk",
             prompts.RISK_SYSTEM,
             prompts.risk_user(
